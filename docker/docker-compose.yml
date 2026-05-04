@@ -1,0 +1,52 @@
+# mhr-ggate | full VPS-side stack
+#
+# Usage:
+#   1. cp ../.env.example .env  &&  edit values
+#   2. put your VMess UUID into ../server/xray_server.json
+#   3. docker compose up -d
+#   4. point nginx (host or another container) at relay :8080
+#
+# Nginx is intentionally NOT in this stack so you can keep using your
+# existing TLS termination.
+
+services:
+  xray:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: mhr-xray
+    restart: unless-stopped
+    command: ["run", "-config", "/etc/xray/config.json"]
+    volumes:
+      - ../server/xray_server.json:/etc/xray/config.json:ro
+      - xray-logs:/var/log/xray
+    networks:
+      - mhr
+    expose:
+      - "10000"
+
+  relay:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    image: mhr-ggate/relay:latest
+    container_name: mhr-relay
+    restart: unless-stopped
+    depends_on:
+      - xray
+    environment:
+      MHR_SECRET: ${MHR_SECRET:?set MHR_SECRET in .env}
+      XRAY_HOST: xray
+      XRAY_PORT: "10000"
+      LISTEN_HOST: 0.0.0.0
+      LISTEN_PORT: "8080"
+      LOG_LEVEL:   INFO
+    ports:
+      - "127.0.0.1:8080:8080"   # bind to loopback; nginx fronts it
+    networks:
+      - mhr
+
+volumes:
+  xray-logs:
+
+networks:
+  mhr:
+    driver: bridge
