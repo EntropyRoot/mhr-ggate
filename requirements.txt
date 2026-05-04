@@ -1,0 +1,17 @@
+# mhr-ggate runtime dependencies
+# server.py and v2ray/client_relay.py share these.
+# tested with Python 3.10+ on Linux/macOS/Windows.
+#
+# For development / test deps, see requirements-dev.txt.
+
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+httpx>=0.27,<1.0
+
+# tomli only needed for Python < 3.11 (tomllib is stdlib in 3.11+)
+tomli>=2.0; python_version < "3.11"
+
+# certifi gives the fronted transport a sane CA bundle on systems where
+# the OS store is missing or out of date. The transport works without it
+# (falls back to ssl.create_default_context defaults), so it is optional.
+certifi>=2024.2.2
