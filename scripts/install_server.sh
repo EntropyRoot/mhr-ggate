@@ -25,26 +25,47 @@ RELAY_PORT="8080"
 XRAY_PORT="10000"
 INSTALL_DIR="/opt/mhr-ggate"
 NO_TLS="0"
+CONFIGURE_FIREWALL="1"
+RESET_FIREWALL="0"
+EXTRA_SSH_PORTS=""
 
 usage() {
   cat <<USAGE
-usage: $0 --domain <fqdn> --email <addr> --secret <secret> [--no-tls]
+usage: $0 --domain <fqdn> --email <addr> --secret <secret> [options]
 
-  --domain   DNS name pointing at this VPS (required unless --no-tls)
-  --email    contact for Let's Encrypt
-  --secret   shared secret used by client_relay.py / GAS / server.py
-  --no-tls   skip certbot (use a self-signed cert; harder to fingerprint
-             but you'll have to set allowInsecure=true on the GAS side)
+  --domain          DNS name pointing at this VPS (required unless --no-tls)
+  --email           contact for Let's Encrypt
+  --secret          shared secret used by client_relay.py / GAS / server.py
+  --no-tls          skip certbot and use a self-signed certificate
+  --no-firewall     do not change UFW at all
+  --reset-firewall  reset UFW before applying rules (dangerous; off by default)
+  --ssh-port <port> force-preserve an SSH port, can be passed multiple times
+
+Firewall behavior:
+  By default the installer PRESERVES existing UFW rules and only adds safe
+  allows for detected SSH port(s), 80/tcp, and 443/tcp. It does not reset UFW
+  unless --reset-firewall is explicitly passed.
 
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --domain) DOMAIN="$2"; shift 2 ;;
-    --email)  EMAIL="$2";  shift 2 ;;
-    --secret) SECRET="$2"; shift 2 ;;
-    --no-tls) NO_TLS="1";  shift   ;;
+    --domain)
+      [[ $# -ge 2 ]] || { echo "[!] --domain needs a value" >&2; exit 2; }
+      DOMAIN="$2"; shift 2 ;;
+    --email)
+      [[ $# -ge 2 ]] || { echo "[!] --email needs a value" >&2; exit 2; }
+      EMAIL="$2"; shift 2 ;;
+    --secret)
+      [[ $# -ge 2 ]] || { echo "[!] --secret needs a value" >&2; exit 2; }
+      SECRET="$2"; shift 2 ;;
+    --ssh-port)
+      [[ $# -ge 2 ]] || { echo "[!] --ssh-port needs a value" >&2; exit 2; }
+      EXTRA_SSH_PORTS="$EXTRA_SSH_PORTS $2"; shift 2 ;;
+    --no-tls) NO_TLS="1"; shift ;;
+    --no-firewall) CONFIGURE_FIREWALL="0"; shift ;;
+    --reset-firewall) RESET_FIREWALL="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -62,6 +83,86 @@ if [[ "$EUID" -ne 0 ]]; then
   echo "[!] run as root (sudo)" >&2
   exit 2
 fi
+
+backup_file() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    cp "$f" "$f.bak.$(date +%F-%H%M%S)"
+  fi
+}
+
+valid_port() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
+}
+
+collect_ssh_ports() {
+  local ports=() p
+
+  # If installer is running over SSH, SSH_CONNECTION's 4th field is the
+  # server-side port of the current session. This is the most important one.
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    p="$(awk '{print $4}' <<<"$SSH_CONNECTION" 2>/dev/null || true)"
+    valid_port "$p" && ports+=("$p")
+  fi
+
+  # Ports currently listened on by sshd.
+  while read -r p; do
+    valid_port "$p" && ports+=("$p")
+  done < <(ss -tulpn 2>/dev/null | awk '/sshd/ {n=split($5,a,":"); print a[n]}' | sort -nu || true)
+
+  # Ports explicitly configured in sshd_config or sshd_config.d.
+  while read -r p; do
+    valid_port "$p" && ports+=("$p")
+  done < <(grep -RhsE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}' | sort -nu || true)
+
+  # User-forced ports.
+  for p in $EXTRA_SSH_PORTS; do
+    valid_port "$p" && ports+=("$p")
+  done
+
+  # Always keep 22 as a safety net.
+  ports+=("22")
+
+  printf '%s\n' "${ports[@]}" | awk '!seen[$0]++' | sort -nu
+}
+
+configure_firewall_safely() {
+  if [[ "$CONFIGURE_FIREWALL" != "1" ]]; then
+    echo "[*] firewall: skipped (--no-firewall)"
+    return 0
+  fi
+
+  if ! command -v ufw >/dev/null 2>&1; then
+    echo "[*] firewall: ufw not installed, skipping"
+    return 0
+  fi
+
+  echo "[*] firewall (ufw safe mode)..."
+  mapfile -t SSH_PORTS < <(collect_ssh_ports)
+  echo "[*] preserving SSH port(s): ${SSH_PORTS[*]}"
+
+  if [[ "$RESET_FIREWALL" == "1" ]]; then
+    echo "[!] resetting UFW because --reset-firewall was explicitly requested"
+    ufw --force reset >/dev/null 2>&1 || true
+    ufw default deny incoming
+    ufw default allow outgoing
+  else
+    echo "[*] preserving existing UFW rules (no reset)"
+    if ! ufw status | grep -q '^Status: active'; then
+      ufw default deny incoming
+      ufw default allow outgoing
+    fi
+  fi
+
+  for p in "${SSH_PORTS[@]}"; do
+    ufw allow "${p}/tcp" comment 'mhr-ggate preserve ssh' >/dev/null || true
+  done
+  ufw allow 80/tcp comment 'mhr-ggate http' >/dev/null || true
+  ufw allow 443/tcp comment 'mhr-ggate https' >/dev/null || true
+
+  ufw --force enable
+  ufw status verbose
+}
 
 echo "[*] installing system packages..."
 export DEBIAN_FRONTEND=noninteractive
@@ -88,6 +189,13 @@ echo "[*] writing $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
 # this script is shipped alongside the rest of the repo. copy it in.
 SRC_DIR="$(cd "$(dirname "$0")"/.. && pwd)"
+if [[ ! -d "$SRC_DIR/server" || ! -f "$SRC_DIR/requirements.txt" ]]; then
+  echo "[!] repository files not found next to installer." >&2
+  echo "    Run this script from the cloned repository, e.g.:" >&2
+  echo "      cd mhr-ggate && sudo bash scripts/install_server.sh ..." >&2
+  echo "    Piping only install_server.sh into bash cannot work because server/ and requirements.txt are needed." >&2
+  exit 2
+fi
 cp -r "$SRC_DIR"/server "$INSTALL_DIR"/server
 cp    "$SRC_DIR"/requirements.txt "$INSTALL_DIR"/
 
@@ -103,6 +211,7 @@ data = json.loads(p.read_text())
 data["inbounds"][0]["settings"]["clients"][0]["id"] = "$UUID"
 p.write_text(json.dumps(data, indent=2))
 PY
+backup_file /usr/local/etc/xray/config.json
 cp "$INSTALL_DIR/server/xray_server.json" /usr/local/etc/xray/config.json
 
 echo "[*] writing systemd units..."
@@ -138,8 +247,17 @@ systemctl enable --now mhr-relay.service
 
 echo "[*] writing nginx site..."
 SITE_FILE="/etc/nginx/sites-available/mhr-ggate"
+mkdir -p /var/www/html
+backup_file "$SITE_FILE"
+
+# If UFW is already active, make sure ACME/http/https are reachable before
+# requesting certificates. This does not enable UFW if it was disabled.
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+  ufw allow 80/tcp comment 'mhr-ggate http' >/dev/null || true
+  ufw allow 443/tcp comment 'mhr-ggate https' >/dev/null || true
+fi
+
 if [[ "$NO_TLS" == "1" ]]; then
-  # self-signed
   mkdir -p /etc/nginx/ssl
   if [[ ! -f /etc/nginx/ssl/mhr.crt ]]; then
     openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
@@ -154,6 +272,42 @@ else
   SERVER_NAME="$DOMAIN"
   CERT_FILE="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
   KEY_FILE="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+
+  # Do NOT write an HTTPS nginx server before the certificate exists; nginx
+  # would fail to reload. Use a temporary HTTP-only site for certbot webroot.
+  cat >"$SITE_FILE" <<NGINX_HTTP
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $SERVER_NAME;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 200 "mhr-ggate bootstrap\n";
+        add_header Content-Type text/plain;
+    }
+}
+NGINX_HTTP
+
+  ln -sf "$SITE_FILE" /etc/nginx/sites-enabled/mhr-ggate
+  rm -f /etc/nginx/sites-enabled/default
+  nginx -t
+  systemctl reload nginx || systemctl restart nginx
+
+  if ! certbot certonly --webroot -w /var/www/html --non-interactive --agree-tos \
+      --email "$EMAIL" -d "$DOMAIN"; then
+    echo "[!] certbot failed; falling back to self-signed certificate" >&2
+    mkdir -p /etc/nginx/ssl
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+      -keyout /etc/nginx/ssl/mhr.key \
+      -out    /etc/nginx/ssl/mhr.crt \
+      -subj "/CN=${DOMAIN:-mhr-ggate}"
+    CERT_FILE="/etc/nginx/ssl/mhr.crt"
+    KEY_FILE="/etc/nginx/ssl/mhr.key"
+  fi
 fi
 
 cat >"$SITE_FILE" <<NGINX
@@ -180,7 +334,6 @@ server {
     ssl_ciphers         HIGH:!aNULL:!MD5;
     ssl_prefer_server_ciphers on;
 
-    # nothing else on this server, so harden defaults
     server_tokens off;
     add_header Strict-Transport-Security "max-age=31536000" always;
 
@@ -201,25 +354,10 @@ NGINX
 
 ln -sf "$SITE_FILE" /etc/nginx/sites-enabled/mhr-ggate
 rm -f /etc/nginx/sites-enabled/default
-
-if [[ "$NO_TLS" != "1" ]]; then
-  systemctl reload nginx || systemctl restart nginx
-  certbot --nginx --non-interactive --agree-tos \
-    --email "$EMAIL" -d "$DOMAIN" --redirect || {
-      echo "[!] certbot failed; falling back to self-signed" >&2
-    }
-fi
-
+nginx -t
 systemctl restart nginx
 
-echo "[*] firewall (ufw)..."
-ufw --force reset >/dev/null 2>&1 || true
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw --force enable
+configure_firewall_safely
 
 cat <<DONE
 
